@@ -1,3 +1,4 @@
+import html as html_lib
 import os
 import re
 from datetime import datetime
@@ -14,6 +15,22 @@ API_KEY = os.environ.get("ANALYZER_API_KEY", "")
 
 class AnalyzeRequest(BaseModel):
     url: str
+
+
+def parse_count(s: str) -> int:
+    s = s.strip().lower()
+    mult = 1
+    if s.endswith("k"):
+        mult = 1_000
+        s = s[:-1]
+    elif s.endswith("m"):
+        mult = 1_000_000
+        s = s[:-1]
+    s = s.replace(",", "")  # thousands separator, not decimal
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        return 0
 
 
 def classify_fetch_error(exc: Exception) -> str:
@@ -157,6 +174,72 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     result["ok"] = True
     result["usedBrowser"] = used_browser
     return result
+
+
+@app.post("/analyze-instagram")
+def analyze_instagram(req: AnalyzeRequest, x_api_key: str = Header(default="")):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    url = req.url.rstrip("/")
+    handle_match = re.search(r"instagram\.com/([A-Za-z0-9._]+)", url)
+    handle = handle_match.group(1) if handle_match else ""
+
+    html = ""
+    try:
+        page = Fetcher.get(url, stealthy_headers=True, timeout=15)
+        if page.status and 200 <= page.status < 400:
+            html = page.body if isinstance(page.body, str) else str(page.body)
+    except Exception:
+        html = ""
+
+    if not html or len(html) < 200:
+        try:
+            page = StealthyFetcher.fetch(url, headless=True, timeout=25000)
+            if page.status and 200 <= page.status < 400:
+                html = page.body if isinstance(page.body, str) else str(page.body)
+        except Exception:
+            html = ""
+
+    if not html or len(html) < 200:
+        return {"ok": False, "handle": handle}
+
+    # Instagram exposes basic public stats via its link-preview meta tags
+    # (the same data WhatsApp/Slack show when you paste a profile link) -
+    # this reads only that public preview data, not authenticated content.
+    desc_match = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', html, re.I)
+    if not desc_match:
+        desc_match = re.search(r'<meta[^>]+content="([^"]*)"[^>]+property="og:description"', html, re.I)
+    description = desc_match.group(1) if desc_match else ""
+
+    followers = following = posts = None
+    stats_match = re.search(
+        r"([\d.,]+[kKmM]?)\s*Followers,\s*([\d.,]+[kKmM]?)\s*Following,\s*([\d.,]+[kKmM]?)\s*Posts",
+        description,
+    )
+    if stats_match:
+        followers = parse_count(stats_match.group(1))
+        following = parse_count(stats_match.group(2))
+        posts = parse_count(stats_match.group(3))
+
+    bio = ""
+    bio_match = re.search(r"Posts?\s*-\s*(?:See Instagram photos and videos from )?(.*?)(?:\(@|$)", description)
+    if bio_match:
+        bio = html_lib.unescape(bio_match.group(1).strip(" -"))
+        if bio.startswith("@"):
+            bio = ""
+
+    if followers is None and posts is None:
+        return {"ok": False, "handle": handle}
+
+    return {
+        "ok": True,
+        "handle": handle,
+        "followers": followers,
+        "following": following,
+        "posts": posts,
+        "bio": bio,
+    }
 
 
 @app.get("/health")
