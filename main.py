@@ -210,7 +210,7 @@ def analyze_instagram(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     desc_match = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', html, re.I)
     if not desc_match:
         desc_match = re.search(r'<meta[^>]+content="([^"]*)"[^>]+property="og:description"', html, re.I)
-    description = desc_match.group(1) if desc_match else ""
+    description = html_lib.unescape(desc_match.group(1)) if desc_match else ""
 
     followers = following = posts = None
     stats_match = re.search(
@@ -225,7 +225,7 @@ def analyze_instagram(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     bio = ""
     bio_match = re.search(r"Posts?\s*-\s*(?:See Instagram photos and videos from )?(.*?)(?:\(@|$)", description)
     if bio_match:
-        bio = html_lib.unescape(bio_match.group(1).strip(" -"))
+        bio = bio_match.group(1).strip(" -")
         if bio.startswith("@"):
             bio = ""
 
