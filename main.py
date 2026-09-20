@@ -215,7 +215,9 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
             url,
             headless=True,
             timeout=45000,
-            network_idle=True,
+            network_idle=False,
+            block_ads=True,
+            extra_flags=["--disable-dev-shm-usage"],
             page_setup=page_setup,
             page_action=page_action,
         )
