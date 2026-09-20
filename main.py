@@ -227,11 +227,13 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
         fetch_error = str(e)
 
     if not html or len(html) < 200:
+        print(f"[analyze] fetch failed for {url}: {fetch_error}", flush=True)
         reason = classify_fetch_error(Exception(fetch_error or "empty response"))
         return {
             "ok": False,
             "reason": reason,
             "usedBrowser": True,
+            "debug": (fetch_error or "")[:300],
         }
 
     result = analyze_html(html, url, metrics)
