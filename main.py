@@ -1,7 +1,10 @@
 import html as html_lib
 import os
 import re
+import socket
+import ssl
 from datetime import datetime
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -33,6 +36,32 @@ def parse_count(s: str) -> int:
         return 0
 
 
+def ssl_cert_invalid(url: str) -> bool:
+    """True only if we can positively confirm a broken certificate.
+
+    The stealth browser accepts invalid/expired certificates silently (so it
+    can still render pages behind quirky TLS setups), which would otherwise
+    hide a real SSL problem from us - so we check it independently here.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    port = parsed.port or 443
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((hostname, port), timeout=8) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname):
+                pass
+        return False
+    except ssl.SSLCertVerificationError:
+        return True
+    except Exception:
+        return False  # inconclusive (DNS/timeout/etc.) - let the real fetch surface it
+
+
 def classify_fetch_error(exc: Exception) -> str:
     msg = str(exc)
     status_match = re.match(r"^(\d{3})\s*status code", msg)
@@ -45,18 +74,18 @@ def classify_fetch_error(exc: Exception) -> str:
         if code.startswith("5"):
             return "Server-Fehler / Seite vorübergehend down"
         return f"Seite antwortet mit Fehlercode {code}"
-    if re.search(r"ENOTFOUND|getaddrinfo|Name or service not known|could not resolve", msg, re.I):
+    if re.search(r"ENOTFOUND|getaddrinfo|Name or service not known|could not resolve|ERR_NAME_NOT_RESOLVED", msg, re.I):
         return "Domain existiert nicht mehr (DNS-Fehler)"
-    if re.search(r"certificate|SSL|CERT_HAS_EXPIRED|self[- ]signed|unable to verify", msg, re.I):
+    if re.search(r"certificate|SSL|CERT_HAS_EXPIRED|self[- ]signed|unable to verify|ERR_CERT", msg, re.I):
         return "SSL-Zertifikat ungültig oder abgelaufen"
     if re.search(r"timeout|timed out", msg, re.I):
         return "Zeitüberschreitung beim Laden der Seite"
-    if re.search(r"ECONNREFUSED|connection refused", msg, re.I):
+    if re.search(r"ECONNREFUSED|connection refused|ERR_CONNECTION_REFUSED", msg, re.I):
         return "Verbindung zum Server verweigert"
     return "Webseite nicht erreichbar / defekt"
 
 
-def analyze_html(html: str, url: str) -> dict:
+def analyze_html(html: str, url: str, metrics: dict) -> dict:
     issues = []
     suggestions = []
 
@@ -66,9 +95,25 @@ def analyze_html(html: str, url: str) -> dict:
         suggestions.append("HTTPS/SSL-Zertifikat einrichten, damit Besucher:innen und Google der Seite vertrauen")
 
     has_viewport = bool(re.search(r"<meta[^>]+viewport", html, re.I))
-    if not has_viewport:
-        issues.append("keine mobile Optimierung")
+    mobile_overflow = metrics.get("mobile_overflow")
+    if mobile_overflow or (not has_viewport and mobile_overflow is not False):
+        issues.append("Inhalte passen nicht sauber auf ein Handy-Display (Layout bricht mobil)")
         suggestions.append("Responsive Design für Smartphones/Tablets nachrüsten")
+
+    broken_images = metrics.get("broken_images") or 0
+    if broken_images > 0:
+        issues.append(f"{broken_images} defekte(s) Bild(er) auf der Seite")
+        suggestions.append("Fehlende/kaputte Bilder ersetzen oder entfernen")
+
+    console_errors = metrics.get("console_errors") or 0
+    if console_errors >= 5:
+        issues.append("zahlreiche technische Fehler beim Laden der Seite (JavaScript-Fehler)")
+        suggestions.append("Technische Fehler auf der Seite beheben lassen")
+
+    load_time_ms = metrics.get("load_time_ms")
+    if load_time_ms and load_time_ms > 6000:
+        issues.append("Seite lädt sehr langsam (mehrere Sekunden)")
+        suggestions.append("Ladezeit optimieren (Bilder komprimieren, Hosting prüfen)")
 
     has_old_tags = bool(re.search(r"<marquee|<frameset|<font[\s>]", html, re.I))
     if has_old_tags:
@@ -123,12 +168,57 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     url = req.url
+
+    if ssl_cert_invalid(url):
+        return {"ok": False, "reason": "SSL-Zertifikat ungültig oder abgelaufen", "usedBrowser": False}
+
     html = ""
     fetch_error = None
-    used_browser = False
+    metrics = {"mobile_overflow": None, "broken_images": None, "console_errors": 0, "load_time_ms": None}
 
+    def page_setup(page):
+        def on_console(msg):
+            if msg.type == "error":
+                metrics["console_errors"] += 1
+        page.on("console", on_console)
+        return page
+
+    def page_action(page):
+        try:
+            timing = page.evaluate(
+                "JSON.stringify(performance.getEntriesByType('navigation')[0] || {})"
+            )
+            import json as _json
+            nav = _json.loads(timing)
+            if nav.get("loadEventEnd") and nav.get("startTime") is not None:
+                metrics["load_time_ms"] = int(nav["loadEventEnd"] - nav["startTime"])
+        except Exception:
+            pass
+        try:
+            page.set_viewport_size({"width": 375, "height": 812})
+            page.wait_for_timeout(500)
+            metrics["mobile_overflow"] = page.evaluate(
+                "document.documentElement.scrollWidth > window.innerWidth + 20"
+            )
+            metrics["broken_images"] = page.evaluate(
+                "Array.from(document.images).filter(img => img.complete && img.naturalWidth === 0).length"
+            )
+        except Exception:
+            pass
+        return page
+
+    # Always render with a real headless browser so we see the page the way an
+    # actual visitor (and their phone) would - a raw HTTP fetch misses anything
+    # JS-rendered and can't tell us whether the layout actually breaks on mobile.
     try:
-        page = Fetcher.get(url, stealthy_headers=True, timeout=20)
+        page = StealthyFetcher.fetch(
+            url,
+            headless=True,
+            timeout=45000,
+            network_idle=True,
+            page_setup=page_setup,
+            page_action=page_action,
+        )
         if page.status and 200 <= page.status < 400:
             html = page.body if isinstance(page.body, str) else str(page.body)
         else:
@@ -136,43 +226,18 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     except Exception as e:
         fetch_error = str(e)
 
-    # A conclusive, page-level or network-level failure (expired cert, dead domain,
-    # real 404) won't be fixed by rendering with a real browser - only retry with
-    # the heavier browser fallback for likely bot-blocking scenarios (403, empty
-    # response, generic connection hiccups).
-    first_reason = classify_fetch_error(Exception(fetch_error)) if fetch_error else None
-    conclusive_reasons = {
-        "Domain existiert nicht mehr (DNS-Fehler)",
-        "SSL-Zertifikat ungültig oder abgelaufen",
-        "Seite nicht gefunden (404-Fehler)",
-    }
-    should_try_browser = (not html or len(html) < 200) and first_reason not in conclusive_reasons
-
-    if should_try_browser:
-        try:
-            page = StealthyFetcher.fetch(url, headless=True, timeout=30000)
-            used_browser = True
-            if page.status and 200 <= page.status < 400:
-                html = page.body if isinstance(page.body, str) else str(page.body)
-                fetch_error = None
-            else:
-                fetch_error = fetch_error or f"{page.status} status code"
-        except Exception as e:
-            # keep the original (often more informative) error if we had one
-            if not fetch_error:
-                fetch_error = str(e)
-
     if not html or len(html) < 200:
         reason = classify_fetch_error(Exception(fetch_error or "empty response"))
         return {
             "ok": False,
             "reason": reason,
-            "usedBrowser": used_browser,
+            "usedBrowser": True,
         }
 
-    result = analyze_html(html, url)
+    result = analyze_html(html, url, metrics)
     result["ok"] = True
-    result["usedBrowser"] = used_browser
+    result["usedBrowser"] = True
+    result["loadTimeMs"] = metrics["load_time_ms"]
     return result
 
 
