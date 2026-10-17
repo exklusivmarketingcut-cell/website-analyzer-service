@@ -1,8 +1,11 @@
 import html as html_lib
+import ipaddress
+import json
 import os
 import re
 import socket
 import ssl
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -14,6 +17,14 @@ from scrapling.fetchers import Fetcher, StealthyFetcher
 app = FastAPI()
 
 API_KEY = os.environ.get("ANALYZER_API_KEY", "")
+DEBUG = os.environ.get("ANALYZER_DEBUG", "").lower() in ("1", "true", "yes")
+
+# Every headless browser needs a few hundred MB of RAM - running several at
+# once is what kills small instances (OOM), so cap how many run in parallel.
+_browser_slots = threading.BoundedSemaphore(int(os.environ.get("MAX_BROWSERS", "1")))
+BROWSER_SLOT_WAIT_S = 120
+
+INSTAGRAM_RESERVED = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct"}
 
 
 class AnalyzeRequest(BaseModel):
@@ -34,6 +45,48 @@ def parse_count(s: str) -> int:
         return int(float(s) * mult)
     except ValueError:
         return 0
+
+
+def normalize_url(raw: str) -> str:
+    """Accept what people actually paste ("example.de", "www.example.de/ ")
+    and turn it into a fetchable absolute URL, or raise ValueError."""
+    url = (raw or "").strip()
+    if not url:
+        raise ValueError("empty url")
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("invalid url")
+    return url
+
+
+def resolve_host(url: str) -> list:
+    """Resolve the URL's host. Raises socket.gaierror if the domain doesn't exist."""
+    parsed = urlparse(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    infos = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
+    return [ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos]
+
+
+def is_public_address(addrs: list) -> bool:
+    # Don't let the service be used to probe internal infrastructure (SSRF).
+    return bool(addrs) and all(a.is_global for a in addrs)
+
+
+def response_text(page) -> str:
+    """Scrapling returns the raw body as bytes - decode it properly instead of
+    str(bytes), which yields a mangled "b'...'" repr."""
+    body = page.body
+    if isinstance(body, str):
+        return body
+    if not body:
+        return ""
+    encoding = getattr(page, "encoding", None) or "utf-8"
+    try:
+        return body.decode(encoding, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
 
 
 def ssl_cert_invalid(url: str) -> bool:
@@ -120,11 +173,13 @@ def analyze_html(html: str, url: str, metrics: dict) -> dict:
         issues.append("technisch veraltetes Layout (alte HTML-Tags)")
         suggestions.append("Technischen Unterbau modernisieren (kein Table-/Frame-Layout mehr)")
 
-    current_year_for_filter = datetime.now().year
-    years = [int(y) for y in re.findall(r"(?:19|20)\d{2}", html)]
-    years = [y for y in years if 1995 <= y <= current_year_for_filter]
-    max_year = max(years) if years else None
+    # Only look at visible markup - scripts/styles are full of version numbers
+    # and IDs that look like years.
+    visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", html, flags=re.I | re.S)
     current_year = datetime.now().year
+    years = [int(y) for y in re.findall(r"(?<![\d.])(?:19|20)\d{2}(?![\d.])", visible)]
+    years = [y for y in years if 1995 <= y <= current_year]
+    max_year = max(years) if years else None
     if max_year and (current_year - max_year) >= 4:
         issues.append(f"zuletzt aktualisiert vor ca. {current_year - max_year} Jahren")
         suggestions.append("Inhalte und Design auf aktuellen Stand bringen")
@@ -167,7 +222,19 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    url = req.url
+    try:
+        url = normalize_url(req.url)
+    except ValueError:
+        return {"ok": False, "reason": "Ungültige URL", "usedBrowser": False}
+
+    try:
+        addrs = resolve_host(url)
+    except (socket.gaierror, UnicodeError):
+        return {"ok": False, "reason": "Domain existiert nicht mehr (DNS-Fehler)", "usedBrowser": False}
+    except Exception:
+        addrs = None  # inconclusive - let the browser fetch decide
+    if addrs is not None and not is_public_address(addrs):
+        return {"ok": False, "reason": "Ungültige URL", "usedBrowser": False}
 
     if ssl_cert_invalid(url):
         return {"ok": False, "reason": "SSL-Zertifikat ungültig oder abgelaufen", "usedBrowser": False}
@@ -177,6 +244,7 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     metrics = {"mobile_overflow": None, "broken_images": None, "console_errors": 0, "load_time_ms": None}
 
     def page_setup(page):
+        metrics["console_errors"] = 0  # reset in case the fetcher retries
         def on_console(msg):
             if msg.type == "error":
                 metrics["console_errors"] += 1
@@ -188,8 +256,7 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
             timing = page.evaluate(
                 "JSON.stringify(performance.getEntriesByType('navigation')[0] || {})"
             )
-            import json as _json
-            nav = _json.loads(timing)
+            nav = json.loads(timing)
             if nav.get("loadEventEnd") and nav.get("startTime") is not None:
                 metrics["load_time_ms"] = int(nav["loadEventEnd"] - nav["startTime"])
         except Exception:
@@ -210,11 +277,14 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     # Always render with a real headless browser so we see the page the way an
     # actual visitor (and their phone) would - a raw HTTP fetch misses anything
     # JS-rendered and can't tell us whether the layout actually breaks on mobile.
+    if not _browser_slots.acquire(timeout=BROWSER_SLOT_WAIT_S):
+        return {"ok": False, "reason": "Analyse-Dienst ausgelastet, bitte später erneut versuchen", "usedBrowser": False}
     try:
         page = StealthyFetcher.fetch(
             url,
             headless=True,
             timeout=45000,
+            retries=1,  # default is 3, which turns one dead site into minutes of waiting
             network_idle=False,
             block_ads=True,
             extra_flags=["--disable-dev-shm-usage"],
@@ -222,21 +292,21 @@ def analyze(req: AnalyzeRequest, x_api_key: str = Header(default="")):
             page_action=page_action,
         )
         if page.status and 200 <= page.status < 400:
-            html = page.body if isinstance(page.body, str) else str(page.body)
+            html = response_text(page)
         else:
             fetch_error = f"{page.status} status code"
     except Exception as e:
         fetch_error = str(e)
+    finally:
+        _browser_slots.release()
 
     if not html or len(html) < 200:
         print(f"[analyze] fetch failed for {url}: {fetch_error}", flush=True)
         reason = classify_fetch_error(Exception(fetch_error or "empty response"))
-        return {
-            "ok": False,
-            "reason": reason,
-            "usedBrowser": True,
-            "debug": (fetch_error or "")[:300],
-        }
+        result = {"ok": False, "reason": reason, "usedBrowser": True}
+        if DEBUG:
+            result["debug"] = (fetch_error or "")[:300]
+        return result
 
     result = analyze_html(html, url, metrics)
     result["ok"] = True
@@ -250,25 +320,35 @@ def analyze_instagram(req: AnalyzeRequest, x_api_key: str = Header(default="")):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    url = req.url.rstrip("/")
-    handle_match = re.search(r"instagram\.com/([A-Za-z0-9._]+)", url)
+    raw = (req.url or "").strip()
+    if raw.startswith("@"):
+        raw = "instagram.com/" + raw[1:]
+    handle_match = re.search(r"instagram\.com/([A-Za-z0-9._]+)", raw, re.I)
     handle = handle_match.group(1) if handle_match else ""
+    if not handle or handle.lower() in INSTAGRAM_RESERVED:
+        return {"ok": False, "handle": handle}
+    # Always fetch the canonical profile URL - never an arbitrary user-supplied host.
+    url = f"https://www.instagram.com/{handle}/"
 
     html = ""
     try:
         page = Fetcher.get(url, stealthy_headers=True, timeout=15)
         if page.status and 200 <= page.status < 400:
-            html = page.body if isinstance(page.body, str) else str(page.body)
+            html = response_text(page)
     except Exception:
         html = ""
 
     if not html or len(html) < 200:
-        try:
-            page = StealthyFetcher.fetch(url, headless=True, timeout=25000)
-            if page.status and 200 <= page.status < 400:
-                html = page.body if isinstance(page.body, str) else str(page.body)
-        except Exception:
-            html = ""
+        if _browser_slots.acquire(timeout=BROWSER_SLOT_WAIT_S):
+            try:
+                page = StealthyFetcher.fetch(url, headless=True, timeout=25000, retries=1,
+                                             extra_flags=["--disable-dev-shm-usage"])
+                if page.status and 200 <= page.status < 400:
+                    html = response_text(page)
+            except Exception:
+                html = ""
+            finally:
+                _browser_slots.release()
 
     if not html or len(html) < 200:
         return {"ok": False, "handle": handle}
